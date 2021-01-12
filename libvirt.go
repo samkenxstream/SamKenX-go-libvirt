@@ -39,6 +39,22 @@ import (
 // are unsupported by either QEMU or libvirt.
 var ErrEventsNotSupported = errors.New("event monitor is not supported")
 
+// ConnectURI defines a type for driver URIs for libvirt
+// the defined constants are *not* exhaustive as there are also options
+// e.g. to connect remote via SSH
+type ConnectURI string
+
+const (
+	// QEMUSystem connects to a QEMU system mode daemon
+	QEMUSystem ConnectURI = "qemu:///system"
+	// QEMUSession connects to a QEMU session mode daemon (unprivileged)
+	QEMUSession ConnectURI = "qemu:///session"
+	// XenSystem connects to a Xen system mode daemon
+	XenSystem ConnectURI = "xen:///system"
+	//TestDefault connect to default mock driver
+	TestDefault ConnectURI = "test:///default"
+)
+
 // Libvirt implements libvirt's remote procedure call protocol.
 type Libvirt struct {
 	conn net.Conn
@@ -93,16 +109,16 @@ func (l *Libvirt) Capabilities() ([]byte, error) {
 	return []byte(caps), err
 }
 
-// Connect establishes communication with the libvirt server.
+// ConnectToURI establishes communication with the specified libvirt driver
 // The underlying libvirt socket connection must be previously established.
-func (l *Libvirt) Connect() error {
+func (l *Libvirt) ConnectToURI(uri ConnectURI) error {
 	payload := struct {
 		Padding [3]byte
 		Name    string
 		Flags   uint32
 	}{
 		Padding: [3]byte{0x1, 0x0, 0x0},
-		Name:    "qemu:///system",
+		Name:    string(uri),
 		Flags:   0,
 	}
 
@@ -126,9 +142,25 @@ func (l *Libvirt) Connect() error {
 	return nil
 }
 
+// Connect establishes communication with the libvirt server.
+// The underlying libvirt socket connection must be previously established.
+func (l *Libvirt) Connect() error {
+	return l.ConnectToURI(QEMUSystem)
+}
+
 // Disconnect shuts down communication with the libvirt server and closes the
 // underlying net.Conn.
 func (l *Libvirt) Disconnect() error {
+	// Ordering is important here. We want to make sure the connection is closed
+	// before unsubscribing and deregistering the events and requests, to
+	// prevent new requests from racing.
+	_, err := l.request(constants.ProcConnectClose, constants.Program, nil)
+	if err != nil {
+		return err
+	}
+
+	err = l.conn.Close()
+
 	// close event streams
 	for _, ev := range l.events {
 		l.unsubscribeEvents(ev)
@@ -138,12 +170,7 @@ func (l *Libvirt) Disconnect() error {
 	// outstanding requests
 	l.deregisterAll()
 
-	_, err := l.request(constants.ProcConnectClose, constants.Program, nil)
-	if err != nil {
-		return err
-	}
-
-	return l.conn.Close()
+	return err
 }
 
 // Domains returns a list of all domains managed by libvirt.
@@ -290,7 +317,6 @@ func (l *Libvirt) LifecycleEvents(ctx context.Context) (<-chan DomainEventLifecy
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		defer l.unsubscribeEvents(stream)
-		defer stream.Shutdown()
 		defer func() { close(ch) }()
 
 		for {
