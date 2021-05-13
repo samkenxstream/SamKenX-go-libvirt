@@ -125,8 +125,8 @@ type DomainSnapshot struct {
 	Dom Domain
 }
 
-// Error is libvirt's remote_error
-type Error struct {
+// remote_error is libvirt's remote_error
+type remote_error struct {
 	Code int32
 	OptDomain int32
 	Message OptString
@@ -169,7 +169,7 @@ type NodeGetMemoryStats struct {
 // DomainDiskError is libvirt's remote_domain_disk_error
 type DomainDiskError struct {
 	Disk string
-	Error int32
+	remote_error int32
 }
 
 // ConnectOpenArgs is libvirt's remote_connect_open_args
@@ -1334,7 +1334,7 @@ type DomainGetCPUStatsRet struct {
 // DomainGetHostnameArgs is libvirt's remote_domain_get_hostname_args
 type DomainGetHostnameArgs struct {
 	Dom Domain
-	Flags uint32
+	Flags DomainGetHostnameFlags
 }
 
 // DomainGetHostnameRet is libvirt's remote_domain_get_hostname_ret
@@ -11947,7 +11947,7 @@ func (l *Libvirt) DomainEventBalloonChange() (err error) {
 }
 
 // DomainGetHostname is the go wrapper for REMOTE_PROC_DOMAIN_GET_HOSTNAME.
-func (l *Libvirt) DomainGetHostname(Dom Domain, Flags uint32) (rHostname string, err error) {
+func (l *Libvirt) DomainGetHostname(Dom Domain, Flags DomainGetHostnameFlags) (rHostname string, err error) {
 	var buf []byte
 
 	args := DomainGetHostnameArgs {

@@ -24,6 +24,7 @@ import (
 	"github.com/digitalocean/go-libvirt/internal/event"
 	xdr "github.com/digitalocean/go-libvirt/internal/go-xdr/xdr2"
 	"github.com/digitalocean/go-libvirt/libvirttest"
+	"github.com/digitalocean/go-libvirt/socket"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -32,15 +33,6 @@ var (
 	testUUID = [UUIDBuflen]byte{
 		0xdc, 0x22, 0x9f, 0x87, 0xd4, 0xde, 0x47, 0x19,
 		0x8c, 0xfd, 0x2e, 0x21, 0xc6, 0x10, 0x5b, 0x01,
-	}
-
-	testHeader = []byte{
-		0x20, 0x00, 0x80, 0x86, // program
-		0x00, 0x00, 0x00, 0x01, // version
-		0x00, 0x00, 0x00, 0x01, // procedure
-		0x00, 0x00, 0x00, 0x00, // type
-		0x00, 0x00, 0x00, 0x00, // serial
-		0x00, 0x00, 0x00, 0x00, // status
 	}
 
 	testEventHeader = []byte{
@@ -139,56 +131,7 @@ var (
 		// error level
 		0x00, 0x00, 0x00, 0x01,
 	}
-
-	testDomain = &Domain{
-		Name: "test-domain",
-		UUID: testUUID,
-		ID:   1,
-	}
 )
-
-func TestExtractHeader(t *testing.T) {
-	r := bytes.NewBuffer(testHeader)
-	h, err := extractHeader(r)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if h.Program != constants.Program {
-		t.Errorf("expected Program %q, got %q", constants.Program, h.Program)
-	}
-
-	if h.Version != constants.ProtocolVersion {
-		t.Errorf("expected version %q, got %q", constants.ProtocolVersion, h.Version)
-	}
-
-	if h.Procedure != constants.ProcConnectOpen {
-		t.Errorf("expected procedure %q, got %q", constants.ProcConnectOpen, h.Procedure)
-	}
-
-	if h.Type != Call {
-		t.Errorf("expected type %q, got %q", Call, h.Type)
-	}
-
-	if h.Status != StatusOK {
-		t.Errorf("expected status %q, got %q", StatusOK, h.Status)
-	}
-}
-
-func TestPktLen(t *testing.T) {
-	data := []byte{0x00, 0x00, 0x00, 0xa} // uint32:10
-	r := bytes.NewBuffer(data)
-
-	expected := uint32(10)
-	actual, err := pktlen(r)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if expected != actual {
-		t.Errorf("expected packet length %q, got %q", expected, actual)
-	}
-}
 
 func TestDecodeEvent(t *testing.T) {
 	var e DomainEvent
@@ -240,10 +183,10 @@ func TestDecodeEvent(t *testing.T) {
 
 func TestDecodeError(t *testing.T) {
 	expectedMsg := "Requested operation is not valid: domain is not running"
-	expectedCode := errOperationInvalid
+	expectedCode := ErrOperationInvalid
 
 	err := decodeError(testErrorMessage)
-	e := err.(libvirtError)
+	e := err.(Error)
 	if e.Message != expectedMsg {
 		t.Errorf("expected error message %s, got %s", expectedMsg, err.Error())
 	}
@@ -255,6 +198,12 @@ func TestDecodeError(t *testing.T) {
 func TestErrNotFound(t *testing.T) {
 	err := decodeError(testErrorNotFoundMessage)
 	ok := IsNotFound(err)
+	if !ok {
+		t.Errorf("expected true, got %t", ok)
+	}
+
+	err = fmt.Errorf("something went wrong: %w", err)
+	ok = IsNotFound(err)
 	if !ok {
 		t.Errorf("expected true, got %t", ok)
 	}
@@ -325,19 +274,61 @@ func TestRemoveStream(t *testing.T) {
 	conn := libvirttest.New()
 	l := New(conn)
 
+	err := l.Connect()
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer l.Disconnect()
+
 	stream := event.NewStream(constants.QEMUProgram, id)
 	defer stream.Shutdown()
 
 	l.events[id] = stream
 
 	fmt.Println("removing stream")
-	err := l.removeStream(id)
+	err = l.removeStream(id)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if _, ok := l.events[id]; ok {
 		t.Error("expected event stream to be removed")
+	}
+}
+
+func TestRemoveAllStreams(t *testing.T) {
+	id1 := int32(1)
+	id2 := int32(2)
+
+	conn := libvirttest.New()
+	l := New(conn)
+
+	err := l.Connect()
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer l.Disconnect()
+
+	// verify it's a successful no-op when no streams have been added
+	l.removeAllStreams()
+	if len(l.events) != 0 {
+		t.Fatal("expected no streams after remove all")
+	}
+
+	stream := event.NewStream(constants.QEMUProgram, id1)
+	defer stream.Shutdown()
+
+	l.events[id1] = stream
+
+	stream2 := event.NewStream(constants.QEMUProgram, id2)
+	defer stream2.Shutdown()
+
+	l.events[id2] = stream2
+
+	l.removeAllStreams()
+
+	if len(l.events) != 0 {
+		t.Error("expected all event streams to be removed")
 	}
 }
 
@@ -388,14 +379,16 @@ func TestSerial(t *testing.T) {
 }
 
 func TestLookup(t *testing.T) {
-	id := int32(1)
-	c := make(chan response)
 	name := "test"
 
 	conn := libvirttest.New()
 	l := New(conn)
 
-	l.register(id, c)
+	err := l.Connect()
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer l.Disconnect()
 
 	d, err := l.lookup(name)
 	if err != nil {
@@ -404,11 +397,6 @@ func TestLookup(t *testing.T) {
 
 	if d.Name != name {
 		t.Errorf("expected domain %s, got %s", name, d.Name)
-	}
-
-	// The callback should now be deregistered.
-	if _, ok := l.callbacks[id]; ok {
-		t.Error("expected callback to deregister")
 	}
 }
 
@@ -452,17 +440,25 @@ func TestRouteDeadlock(t *testing.T) {
 
 	l.addStream(stream)
 
-	respHeader := &header{constants.Program, 0, 0, 0, id, StatusOK}
-	eventHeader := &header{constants.Program, 0, constants.ProcDomainEventCallbackLifecycle, 0, 0, StatusOK}
+	respHeader := &socket.Header{
+		Program: constants.Program,
+		Serial:  id,
+		Status:  socket.StatusOK,
+	}
+	eventHeader := &socket.Header{
+		Program:   constants.Program,
+		Procedure: constants.ProcDomainEventCallbackLifecycle,
+		Status:    socket.StatusOK,
+	}
 
 	send := func(respCount, evCount int) {
 		// Send the events first
 		for i := 0; i < evCount; i++ {
-			l.route(eventHeader, testLifeCycle)
+			l.Route(eventHeader, testLifeCycle)
 		}
 		// Now send the requests.
 		for i := 0; i < respCount; i++ {
-			l.route(respHeader, []byte{})
+			l.Route(respHeader, []byte{})
 		}
 	}
 
@@ -480,7 +476,7 @@ func TestRouteDeadlock(t *testing.T) {
 
 		for i := 0; i < tc.rCount; i++ {
 			r := <-rch
-			assert.Equal(t, r.Status, uint32(StatusOK))
+			assert.Equal(t, r.Status, uint32(socket.StatusOK))
 		}
 		for i := 0; i < tc.eCount; i++ {
 			e := <-stream.Recv()

@@ -28,6 +28,7 @@ type Stream struct {
 
 	// manage unbounded channel behavior.
 	queue   []Event
+	peek    chan []Event
 	in, out chan Event
 
 	// terminates processing
@@ -69,11 +70,6 @@ func (s *Stream) start() context.CancelFunc {
 // the a listening client. New events pushed onto the queue will not block due
 // to client behavior.
 func (s *Stream) process(ctx context.Context) {
-	defer func() {
-		close(s.in)
-		close(s.out)
-	}()
-
 	for {
 		// informs send() to stop trying
 		nctx, next := context.WithCancel(ctx)
@@ -84,7 +80,10 @@ func (s *Stream) process(ctx context.Context) {
 		case e := <-s.in:
 			s.queue = append(s.queue, e)
 
-		// client recieved an event, pop from queue
+		// safe internal queue lookup
+		case s.peek <- s.queue:
+
+		// client received an event, pop from queue
 		case <-s.send(nctx):
 			if len(s.queue) > 1 {
 				s.queue = s.queue[1:]
@@ -111,15 +110,23 @@ func (s *Stream) send(ctx context.Context) <-chan struct{} {
 	go func() {
 		defer close(ch)
 
-		// do nothing and block if the queue is empty
-		if len(s.queue) == 0 {
-			<-ctx.Done()
+		var q []Event
+
+		// safely grab the current event queue
+		// if the queue is empty, block until canceled
+		select {
+		case q = <-s.peek:
+			if len(q) == 0 {
+				<-ctx.Done()
+				return
+			}
+		case <-ctx.Done():
 			return
 		}
 
-		// otherwise, attempt to send the event
+		// event(s) available, attempt to send
 		select {
-		case s.out <- s.queue[0]:
+		case s.out <- q[0]:
 		case <-ctx.Done():
 		}
 	}()
@@ -137,6 +144,7 @@ func NewStream(program uint32, cbID int32) *Stream {
 		CallbackID: cbID,
 		in:         make(chan Event),
 		out:        make(chan Event),
+		peek:       make(chan []Event),
 	}
 
 	ic.shutdown = ic.start()

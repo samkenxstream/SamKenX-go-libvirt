@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package libvirt is a pure Go implementation of the libvirt RPC protocol.
-// For more information on the protocol, see https://libvirt.org/internals/l.html
 package libvirt
 
 // We'll use c-for-go to extract the consts and typedefs from the libvirt
@@ -21,7 +19,6 @@ package libvirt
 //go:generate scripts/gen-consts.sh
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -29,10 +26,12 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/digitalocean/go-libvirt/internal/constants"
 	"github.com/digitalocean/go-libvirt/internal/event"
 	xdr "github.com/digitalocean/go-libvirt/internal/go-xdr/xdr2"
+	"github.com/digitalocean/go-libvirt/socket"
 )
 
 // ErrEventsNotSupported is returned by Events() if event streams
@@ -53,14 +52,19 @@ const (
 	XenSystem ConnectURI = "xen:///system"
 	//TestDefault connect to default mock driver
 	TestDefault ConnectURI = "test:///default"
+
+	// disconnectedTimeout is how long to wait for disconnect cleanup to
+	// complete
+	disconnectTimeout = 5 * time.Second
 )
 
 // Libvirt implements libvirt's remote procedure call protocol.
 type Libvirt struct {
-	conn net.Conn
-	r    *bufio.Reader
-	w    *bufio.Writer
-	mu   *sync.Mutex
+	// socket connection
+	socket *socket.Socket
+	// closed after cleanup complete following the underlying connection to
+	// libvirt being disconnected.
+	disconnected chan struct{}
 
 	// method callbacks
 	cmux      sync.RWMutex
@@ -158,17 +162,18 @@ func (l *Libvirt) Disconnect() error {
 	if err != nil {
 		return err
 	}
-
-	err = l.conn.Close()
-
-	// close event streams
-	for _, ev := range l.events {
-		l.unsubscribeEvents(ev)
+	err = l.socket.Disconnect()
+	if err != nil {
+		return err
 	}
 
-	// Deregister all callbacks to prevent blocking on clients with
-	// outstanding requests
-	l.deregisterAll()
+	// wait for the listen goroutine to detect the lost connection and clean up
+	// to happen once it returns.  Safeguard with a timeout.
+	// Things not fully cleaned up is better than a deadlock.
+	select {
+	case <-l.disconnected:
+	case <-time.After(disconnectTimeout):
+	}
 
 	return err
 }
@@ -287,10 +292,10 @@ func (l *Libvirt) SubscribeEvents(ctx context.Context, eventID DomainEventID,
 
 // unsubscribeEvents stops the flow of the specified events from libvirt. There
 // are two steps to this process: a call to libvirt to deregister our callback,
-// and then removing the callback from the list used by the `route` fucntion. If
+// and then removing the callback from the list used by the `Route` function. If
 // the deregister call fails, we'll return the error, but still remove the
 // callback from the list. That's ok; if any events arrive after this point, the
-// route function will drop them when it finds no registered handler.
+// Route function will drop them when it finds no registered handler.
 func (l *Libvirt) unsubscribeEvents(stream *event.Stream) error {
 	err := l.ConnectDomainEventCallbackDeregisterAny(stream.CallbackID)
 	l.removeStream(stream.CallbackID)
@@ -317,6 +322,7 @@ func (l *Libvirt) LifecycleEvents(ctx context.Context) (<-chan DomainEventLifecy
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		defer l.unsubscribeEvents(stream)
+		defer stream.Shutdown()
 		defer func() { close(ch) }()
 
 		for {
@@ -616,19 +622,36 @@ func getQEMUError(r response) error {
 	return nil
 }
 
+func (l *Libvirt) waitAndDisconnect() {
+	// wait for the socket to indicate if/when it's been disconnected
+	<-l.socket.Disconnected()
+
+	// close event streams
+	l.removeAllStreams()
+
+	// Deregister all callbacks to prevent blocking on clients with
+	// outstanding requests
+	l.deregisterAll()
+
+	close(l.disconnected)
+}
+
 // New configures a new Libvirt RPC connection.
 func New(conn net.Conn) *Libvirt {
 	l := &Libvirt{
-		conn:      conn,
-		s:         0,
-		r:         bufio.NewReader(conn),
-		w:         bufio.NewWriter(conn),
-		mu:        &sync.Mutex{},
-		callbacks: make(map[int32]chan response),
-		events:    make(map[int32]*event.Stream),
+		s:            0,
+		disconnected: make(chan struct{}),
+		callbacks:    make(map[int32]chan response),
+		events:       make(map[int32]*event.Stream),
 	}
 
-	go l.listen()
+	// this starts the listening and routing
+	// TODO:  The connection and listen goroutine should be moved to the
+	//  Connect function, but this is going to impact the exported API, so
+	//  trying to do as much as possible before doing that.
+	l.socket = socket.New(conn, l)
+
+	go l.waitAndDisconnect()
 
 	return l
 }
